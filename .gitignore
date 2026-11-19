@@ -1,0 +1,16 @@
+build/
+.vs/
+*.user
+*.suo
+*.sdf
+*.ipch
+*.obj
+*.pdb
+*.idb
+*.tlog
+*.log
+Debug/
+Release/
+dist/
+wallpapers/
+.agents/

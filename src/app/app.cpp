@@ -1,0 +1,1435 @@
+#include "app/app.h"
+#include "tui/menu.h"
+#include "tui/dialogs.h"
+#include "tui/image.h"
+#include "core/autostart.h"
+#include "core/transcode.h"
+#include "net/http.h"
+#include "util/str.h"
+
+#include <windows.h>
+#include <shellapi.h>
+
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
+
+#ifndef MOTION_VERSION
+#define MOTION_VERSION "dev"
+#endif
+
+namespace motion {
+
+using namespace tui;
+
+namespace {
+
+std::string joinTags(const std::vector<std::string>& tags) {
+    std::string out;
+    for (size_t i = 0; i < tags.size(); ++i) {
+        if (i) out += ", ";
+        out += tags[i];
+    }
+    return out;
+}
+
+std::vector<std::string> wrapText(const std::string& text, size_t width) {
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        std::string rawLine = (end == std::string::npos) ? text.substr(start) : text.substr(start, end - start);
+        if (end == std::string::npos) start = text.size();
+        else start = end + 1;
+
+        while (!rawLine.empty() && (rawLine.back() == '\r' || rawLine.back() == ' ')) rawLine.pop_back();
+        size_t firstNonSpace = rawLine.find_first_not_of(" \t");
+        if (firstNonSpace == std::string::npos) continue;
+
+        std::string clean = rawLine.substr(firstNonSpace);
+        bool isBullet = false;
+        if (clean.rfind("• ", 0) == 0 || clean.rfind("- ", 0) == 0 || clean.rfind("* ", 0) == 0) {
+            isBullet = true;
+            if (clean.rfind("- ", 0) == 0 || clean.rfind("* ", 0) == 0) {
+                clean = "• " + clean.substr(2);
+            }
+        }
+
+        std::string cur;
+        size_t wi = 0;
+        bool firstWordOfLine = true;
+        while (wi < clean.size()) {
+            size_t wsp = clean.find_first_of(" \t", wi);
+            std::string word = clean.substr(wi, wsp == std::string::npos ? std::string::npos : wsp - wi);
+            if (wsp == std::string::npos) wi = clean.size();
+            else wi = clean.find_first_not_of(" \t", wsp);
+
+            if (word.empty()) continue;
+
+            if (!cur.empty() && cur.size() + 1 + word.size() > width) {
+                lines.push_back(cur);
+                cur.clear();
+                if (isBullet) cur = "  ";
+                firstWordOfLine = true;
+            }
+
+            if (!cur.empty() && !firstWordOfLine) cur += ' ';
+            cur += word;
+            firstWordOfLine = false;
+        }
+        if (!cur.empty()) lines.push_back(cur);
+    }
+    return lines;
+}
+
+}
+
+App::App() : m_config(Config::load()), m_engine(m_config) {
+    m_term.setTitle(L"7nd.motion - live wallpaper");
+    m_term.hideCursor();
+    m_hw = scanHardware();
+    if (m_config.checkForUpdatesOnLaunch) {
+        startAsyncUpdateCheck();
+    }
+}
+
+App::~App() {
+    if (m_updateThread.joinable()) {
+        m_updateThread.detach();
+    }
+}
+
+void App::startAsyncUpdateCheck() {
+    m_updateCheckFinished = false;
+    std::string repo = m_config.updateRepo;
+    m_updateThread = std::thread([this, repo]() {
+        std::string err;
+        updater::UpdateInfo info;
+        if (updater::checkUpdate(repo, MOTION_VERSION, info, err)) {
+            if (info.isNewer && info.latestVersion != m_config.skipUpdateVersion) {
+                m_updateInfo = info;
+            }
+        }
+        m_updateCheckFinished = true;
+    });
+}
+
+int App::run() {
+    if (m_config.firstRun) {
+        autoTune(false);
+        guide();
+        m_config.firstRun = false;
+        m_config.save();
+    }
+    if (!m_engine.isRunning()) {
+        std::string e;
+        m_engine.restart(e);
+    }
+
+    if (m_config.checkForUpdatesOnLaunch) {
+        for (int i = 0; i < 15 && !m_updateCheckFinished.load(); ++i) {
+            Sleep(100);
+        }
+        if (m_updateInfo.isNewer && m_updateInfo.latestVersion != m_config.skipUpdateVersion) {
+            showUpdateDialog(false);
+        }
+    }
+
+    mainMenu();
+    m_term.clearScreen();
+    m_term.showCursor();
+    return 0;
+}
+
+void App::autoTune(bool announce) {
+    m_hw = scanHardware();
+    m_config.quality = recommendedQuality(m_hw);
+    m_config.lowEndMode = recommendLowEnd(m_hw);
+    m_config.save();
+    m_catalogLoaded = false;
+
+    if (!announce) return;
+
+    auto qn = m_config.quality == Quality::High ? "High" :
+              m_config.quality == Quality::Medium ? "Medium" : "Low";
+    char hwline[128];
+    _snprintf_s(hwline, sizeof(hwline), _TRUNCATE,
+                "%d cores · %d GB RAM · %d MB VRAM", m_hw.cores, m_hw.ramGB, m_hw.vramMB);
+    notify("Auto-tune", {
+        { color::green, std::string("✓ Detected a ").append(tierName(m_hw)).append(" PC") },
+        { color::gray,  hwline },
+        { color::cyan,  std::string("Quality set to ").append(qn).append(m_config.lowEndMode ? " + Low-end mode on." : ".") },
+    });
+    std::string err;
+    if (m_engine.isRunning()) m_engine.restart(err);
+}
+
+void App::notify(const std::string& title,
+                 const std::vector<std::pair<const char*, std::string>>& lines) {
+    Frame f;
+    draw::banner(f);
+    draw::title(f, title);
+    for (const auto& [c, text] : lines)
+        f.raw("  ").raw(c).raw(text).raw(color::reset).line();
+    f.line();
+    draw::footer(f, "Press any key to continue…");
+    m_term.present(f);
+    m_term.readKey();
+}
+
+void App::guide() {
+    struct Beat { std::string who; std::string text; };
+    const std::vector<Beat> beats = {
+        { "tenzo", "Yo! Welcome to 7nd.motion. I'm tenzo - I made this." },
+        { "tenzo", "It runs living video wallpapers on your desktop, no heavy apps." },
+        { "tenzo", "Open Browse Library to pull free clips from MoeWalls." },
+        { "tenzo", "Move with W/S or the arrow keys. Press A/D to flip category tabs." },
+        { "tenzo", "Hit / to search anything, R to refresh, and scroll for Load more." },
+        { "tenzo", "Open one to Preview it right here, then Download & apply." },
+        { "tenzo", "Everything you use is kept in My Wallpapers, and it resumes on reboot." },
+        { "tenzo", "That's the tour. Go make your desktop move. - tenzo" },
+    };
+
+    std::string rule;
+    rule.reserve(80);
+    rule.append("  ").append(color::brightCyan)
+        .append("════════════════════════════════════════════════════════")
+        .append(color::reset);
+
+    for (size_t i = 0; i < beats.size(); ++i) {
+        Frame f;
+        draw::banner(f);
+        f.line(rule);
+        f.raw("   ").raw(color::brightCyan).raw(color::bold).raw(beats[i].who).raw(color::reset).line();
+        f.line();
+        for (const std::string& ln : wrapText(beats[i].text, 52))
+            f.raw("   ").raw(color::white).raw(ln).raw(color::reset).line();
+        f.line();
+        f.line(rule);
+        f.line();
+        char pos[16];
+        _snprintf_s(pos, sizeof(pos), _TRUNCATE, "(%d/%d)", (int)i + 1, (int)beats.size());
+        draw::footer(f, std::string("⏎ next   esc skip   ").append(pos));
+        m_term.present(f);
+        if (m_term.readKey().key == Key::Escape) return;
+    }
+}
+
+void App::help() {
+    Frame f;
+    draw::banner(f);
+    draw::title(f, "Help · Quick start");
+    f.raw("  ").raw(color::brightCyan).raw("Apply a wallpaper").raw(color::reset).line();
+    f.line("    Browse Library → pick one → Download & apply.");
+    f.line("    First use downloads it once, then it's cached.");
+    f.line();
+    f.raw("  ").raw(color::brightCyan).raw("Browse & preview").raw(color::reset).line();
+    f.line("    In Browse Library use ⇅ Category to switch (anime, games,");
+    f.line("    landscape, fantasy…). Open one, then 'Preview (open in");
+    f.line("    browser)' to see it before you download.");
+    f.line();
+    f.raw("  ").raw(color::brightCyan).raw("Use your own video").raw(color::reset).line();
+    f.line("    Import a video… → choose a .mp4/.wmv/.mov from your PC.");
+    f.line();
+    f.raw("  ").raw(color::brightCyan).raw("Multiple monitors").raw(color::reset).line();
+    f.line("    Per-monitor setup → assign a different wallpaper per screen.");
+    f.line();
+    f.raw("  ").raw(color::brightCyan).raw("Smooth & light").raw(color::reset).line();
+    f.line("    Performance settings auto-pause a screen when an app goes");
+    f.line("    fullscreen on it (other screens keep playing), and Low-end");
+    f.line("    mode keeps playback at 1080p (skips 4K) for weaker PCs.");
+    f.line();
+    f.raw("  ").raw(color::brightCyan).raw("Controls").raw(color::reset).line();
+    f.line("    Tray icon: mute / stop / reopen. Settings: auto start.");
+    f.line();
+    f.raw("  ").raw(color::magenta).raw("7nd.motion v" MOTION_VERSION)
+     .raw(" · Dev by tenzo").raw(color::reset)
+     .raw(color::gray).raw(" · Open source · MIT").raw(color::reset).line();
+    f.line();
+    draw::footer(f, "Press any key to continue…");
+    m_term.present(f);
+    m_term.readKey();
+}
+
+void App::showUpdateDialog(bool manualCheck) {
+    updater::UpdateInfo info;
+    if (manualCheck || !m_updateInfo.isNewer) {
+        Frame f;
+        draw::banner(f);
+        draw::title(f, "Update Check");
+        f.raw(color::cyan).raw("  Checking for updates online…").raw(color::reset).line();
+        m_term.present(f);
+
+        std::string err;
+        if (!updater::checkUpdate(m_config.updateRepo, MOTION_VERSION, info, err)) {
+            notify("Update Check", {
+                { color::red, "Could not check for updates:" },
+                { color::gray, std::string("  ").append(err) }
+            });
+            return;
+        }
+    } else {
+        info = m_updateInfo;
+    }
+
+    if (!info.isNewer) {
+        notify("Update Check", {
+            { color::green, std::string("✓ 7nd.motion is up to date (v" MOTION_VERSION ").") },
+            { color::gray, "You are running the latest release." }
+        });
+        return;
+    }
+
+    m_updateInfo = info;
+
+    std::string sub = "v" MOTION_VERSION " → v" + info.latestVersion;
+    if (!info.changelog.empty()) {
+        sub += "\n\nWhat's New:";
+        auto lines = wrapText(info.changelog, 66);
+        int maxLines = 5;
+        for (int i = 0; i < (int)lines.size() && i < maxLines; ++i) {
+            sub += "\n" + lines[i];
+        }
+        if ((int)lines.size() > maxLines) {
+            sub += "\n... (" + std::to_string(lines.size() - maxLines) + " more lines in GitHub release)";
+        }
+    }
+
+    Menu menu(m_term, "★ Update Available", sub);
+    menu.setItems({
+        { "Update & Restart now", "download and switch automatically" },
+        { "Open Release on GitHub", "view full release page in browser" },
+        { "Remind me later", "continue using current version" },
+        { "Skip this version", "do not notify for v" + info.latestVersion },
+    });
+    menu.setFooter("↑/↓ move   ⏎ select   esc back");
+
+    int choice = menu.run();
+    if (choice == 0) {
+        performUpdate(info);
+    } else if (choice == 1) {
+        if (!info.htmlUrl.empty()) {
+            ShellExecuteW(nullptr, L"open", widen(info.htmlUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    } else if (choice == 2 || choice == -1) {
+        m_updateInfo.isNewer = false;
+    } else if (choice == 3) {
+        m_config.skipUpdateVersion = info.latestVersion;
+        m_config.save();
+        m_updateInfo = updater::UpdateInfo{};
+        notify("Update Settings", {
+            { color::yellow, std::string("Update v").append(info.latestVersion).append(" will be skipped.") }
+        });
+    }
+}
+
+void App::performUpdate(const updater::UpdateInfo& info) {
+    std::wstring dest = Config::dataDir() + L"\\7nd.motion_update.exe";
+
+    struct Ctx {
+        App* app;
+        int lastPct;
+        std::string ver;
+    };
+    Ctx ctx{ this, -2, info.latestVersion };
+
+    auto onProgress = +[](int pct, void* vctx) {
+        auto* c = (Ctx*)vctx;
+        if (pct == c->lastPct) return;
+        c->lastPct = pct;
+
+        Frame f;
+        draw::banner(f);
+        draw::title(f, "Updating 7nd.motion");
+        f.line();
+        f.raw(color::gray).raw("  Downloading v").raw(c->ver).raw("…").raw(color::reset).line();
+        f.line();
+        if (pct >= 0) {
+            int filled = pct / 5;
+            std::string bar(filled, '#');
+            bar.append(20 - filled, '.');
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "  [%s] %3d%%", bar.c_str(), pct);
+            f.raw(color::cyan).raw(buf).raw(color::reset).line();
+        }
+        c->app->m_term.present(f);
+    };
+
+    std::string err;
+    if (!updater::downloadUpdate(info.downloadUrl, dest, onProgress, &ctx, err)) {
+        notify("Update Failed", {
+            { color::red, "Failed to download update:" },
+            { color::gray, std::string("  ").append(err) },
+            { color::cyan, "You can download it manually from GitHub Releases." }
+        });
+        return;
+    }
+
+    Frame f;
+    draw::banner(f);
+    draw::title(f, "Updating 7nd.motion");
+    f.raw(color::green).raw("  ✓ Download complete! Relaunching…").raw(color::reset).line();
+    m_term.present(f);
+    Sleep(800);
+
+    if (m_engine.isRunning()) {
+        m_engine.stop();
+    }
+
+    if (!updater::applyUpdateAndRestart(dest, err)) {
+        notify("Update Failed", {
+            { color::red, "Failed to apply update:" },
+            { color::gray, std::string("  ").append(err) }
+        });
+        return;
+    }
+
+    m_term.clearScreen();
+    m_term.showCursor();
+    ExitProcess(0);
+}
+
+void App::mainMenu() {
+    while (true) {
+        const bool running = m_engine.isRunning();
+        std::string activeHint;
+        if (running) {
+            activeHint = "● playing: ";
+            activeHint += m_config.mode == WallpaperMode::PerMonitor
+                ? "multiple screens"
+                : (m_config.currentWallpaperId.empty() ? "custom video" : m_config.currentWallpaperId);
+        } else {
+            activeHint = "paused / stopped";
+        }
+
+        std::string subtitle = "A super-lightweight live wallpaper engine.";
+        if (m_updateInfo.isNewer) {
+            subtitle = "[★ Update Available: v" + m_updateInfo.latestVersion + " - see top option]";
+        }
+
+        Menu menu(m_term, "Main menu", subtitle);
+        std::vector<MenuItem> items;
+        int updateIndex = -1;
+        if (m_updateInfo.isNewer) {
+            updateIndex = (int)items.size();
+            items.push_back({ "★ Update Available (v" + m_updateInfo.latestVersion + ")", "optional update" });
+        }
+        int activeIndex = (int)items.size();
+        items.push_back({ "Engine Status & Active Wallpaper", activeHint });
+        int browseIndex = (int)items.size();
+        items.push_back({ "Browse Free Wallpapers",           "download from internet" });
+        int myIndex = (int)items.size();
+        items.push_back({ "My Local Wallpapers",              "saved & imported" });
+        int monitorsIndex = (int)items.size();
+        items.push_back({ "Setup Multiple Monitors",          "assign a different wallpaper per screen" });
+        int settingsIndex = (int)items.size();
+        items.push_back({ "Settings",                         "" });
+        int quitIndex = (int)items.size();
+        items.push_back({ "Quit",                             "" });
+
+        menu.setItems(items);
+        menu.setFooter("↑/↓ move   ⏎ select   q/esc quit");
+
+        int choice = menu.run();
+        if (choice == -1 || choice == quitIndex) return;
+
+        if (choice == updateIndex) {
+            showUpdateDialog(false);
+        } else if (choice == activeIndex) {
+            activeWallpaper();
+        } else if (choice == browseIndex) {
+            browseLibrary();
+        } else if (choice == myIndex) {
+            myWallpapers();
+        } else if (choice == monitorsIndex) {
+            perMonitorSetup();
+        } else if (choice == settingsIndex) {
+            settings();
+        }
+
+        HeapCompact(GetProcessHeap(), 0);
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+    }
+}
+
+bool App::ensureCatalog(bool forceRefresh) {
+    if (m_catalogLoaded && !forceRefresh) return true;
+
+    std::string where;
+    if (!m_moeSearch.empty()) {
+        where.reserve(8 + m_moeSearch.size());
+        where.append("search: ").append(m_moeSearch);
+    } else {
+        where = m_config.moeCategory.empty() ? "latest" : m_config.moeCategory;
+    }
+
+    Frame f;
+    draw::banner(f);
+    draw::title(f, "Library");
+    f.raw(color::gray).raw("  Loading wallpapers (").raw(where).raw(")…").raw(color::reset).line();
+    m_term.present(f);
+
+    int limit = m_moeLimit > 0 ? m_moeLimit : m_config.libraryCount;
+    std::string err;
+    if (m_library.fetchMoeWalls(m_moeSearch, m_config.moeCategory, limit, err)) {
+        m_catalogLoaded = true;
+        return true;
+    }
+
+    m_catalogLoaded = false;
+    notify("Browse Library", {
+        { color::red,   "Couldn't connect to server." },
+        { color::gray,  std::string("  ").append(err.empty() ? "Check your internet connection and try again." : err) }
+    });
+    return false;
+}
+
+int App::pickWallpaper(const std::string& title, const std::string& subtitle) {
+    if (!ensureCatalog()) return -1;
+
+    Menu menu(m_term, title, subtitle);
+    std::vector<MenuItem> items;
+    for (const Wallpaper* w : m_library.items()) {
+        std::string hint;
+        if (w->isLocal) hint = "local";
+        if (Library::isDownloaded(*w)) {
+            if (!hint.empty()) hint += "  ";
+            hint += "✓";
+        }
+        if (!w->resolution.empty()) {
+            if (!hint.empty()) hint += "  ";
+            hint += w->resolution;
+        }
+        items.push_back({ w->title, hint });
+    }
+    menu.setItems(items);
+    menu.setFooter("↑/↓ move   ⏎ select   esc back");
+    return menu.run();
+}
+
+static const char* kMoeCategories[] = {
+    "anime", "games", "landscape", "fantasy",
+    "sci-fi", "abstract", "animal", "vehicle", ""
+};
+static const int kMoeCategoryCount =
+    (int)(sizeof(kMoeCategories) / sizeof(kMoeCategories[0]));
+
+void App::browseLibrary() {
+    if (!ensureCatalog()) return;
+
+    int selected = 0;
+    while (true) {
+        std::string sub;
+        if (!m_moeSearch.empty()) {
+            sub.clear();
+            sub.reserve(80 + m_moeSearch.size());
+            sub.append(color::brightCyan).append("search: \"").append(m_moeSearch).append("\"")
+                .append(color::reset).append(color::gray).append("  (a/d → categories)").append(color::reset);
+        } else {
+            for (int i = 0; i < kMoeCategoryCount; ++i) {
+                std::string name = kMoeCategories[i][0] ? kMoeCategories[i] : "latest";
+                bool cur = m_config.moeCategory == kMoeCategories[i];
+                if (cur) {
+                    sub.append(color::brightCyan).append("[").append(name).append("]").append(color::reset).append(" ");
+                } else {
+                    sub.append(color::gray).append(name).append(color::reset).append(" ");
+                }
+            }
+        }
+
+        Menu menu(m_term, "Browse Library", sub);
+        std::vector<MenuItem> items;
+        for (const Wallpaper* w : m_library.items()) {
+            std::string hint;
+            if (w->isLocal) hint = "local";
+            else if (Library::isDownloaded(*w)) hint = "✓ cached";
+            items.push_back({ w->title, hint });
+        }
+        const int loadMoreIdx = (int)items.size();
+        items.push_back({ "▼ Load more", "" });
+        menu.setItems(items);
+        menu.setHotkeys("ad/r");
+        menu.setFooter("w/s or ↑/↓ move   ⏎ open   a/d tabs   / search   r refresh   esc back");
+
+        int choice = menu.run(selected);
+        if (choice == -1) return;
+
+        if (choice == Menu::kHotkey) {
+            char k = menu.hotkey();
+            if (k == 'r') {
+                if (!ensureCatalog(true)) return;
+                selected = 0;
+                continue;
+            }
+            if (k == '/') {
+                Frame f;
+                draw::banner(f);
+                draw::title(f, "Search MoeWalls");
+                f.raw(color::gray).raw("  Search (e.g. naruto, sunset, cyberpunk); blank clears:").raw(color::reset).line();
+                f.line();
+                f.raw("  ");
+                m_term.present(f);
+                m_moeSearch = m_term.readLineAt(13, 3, m_moeSearch);
+                m_moeLimit = 0;
+                if (!ensureCatalog(true)) return;
+                selected = 0;
+                continue;
+            }
+            m_moeSearch.clear();
+            m_moeLimit = 0;
+            int cur = 0;
+            for (int i = 0; i < kMoeCategoryCount; ++i)
+                if (m_config.moeCategory == kMoeCategories[i]) { cur = i; break; }
+            cur = (k == 'd') ? (cur + 1) % kMoeCategoryCount
+                             : (cur - 1 + kMoeCategoryCount) % kMoeCategoryCount;
+            m_config.moeCategory = kMoeCategories[cur];
+            m_config.save();
+            if (!ensureCatalog(true)) return;
+            selected = 0;
+            continue;
+        }
+
+        if (choice == loadMoreIdx) {
+            m_moeLimit = (m_moeLimit > 0 ? m_moeLimit : m_config.libraryCount) + 24;
+            if (!ensureCatalog(true)) return;
+            selected = loadMoreIdx;
+            continue;
+        }
+
+        selected = choice;
+        wallpaperDetail(*m_library.items()[choice]);
+    }
+}
+
+void App::myWallpapers() {
+    while (true) {
+        std::vector<Wallpaper> saved = m_library.savedWallpapers();
+
+        std::string mySubtitle;
+        if (saved.empty()) {
+            mySubtitle = "Nothing yet - import a video or download one from Browse.";
+        } else {
+            mySubtitle = std::to_string(saved.size());
+            mySubtitle += " on this PC";
+        }
+        Menu menu(m_term, "My Wallpapers", mySubtitle);
+        std::vector<MenuItem> items;
+        for (const Wallpaper& w : saved)
+            items.push_back({ w.title, w.author == "imported" ? "import" : "saved" });
+        const int importIdx = (int)saved.size();
+        items.push_back({ "＋ Import a video…", "use your own .mp4" });
+        items.push_back({ "Back", "" });
+        menu.setItems(items);
+        menu.setHotkeys("x");
+        menu.setFooter("w/s move   ⏎ open   x delete   esc back");
+
+        int choice = menu.run();
+        if (choice == -1) return;
+        if (choice == Menu::kHotkey) {
+            int idx = menu.selectedIndex();
+            if (idx >= 0 && idx < (int)saved.size()) deleteWallpaper(saved[idx]);
+            continue;
+        }
+        if (choice == importIdx + 1) return;
+        if (choice == importIdx) { importWallpaper(); continue; }
+        wallpaperDetail(saved[choice]);
+    }
+}
+
+void App::deleteWallpaper(const Wallpaper& w) {
+    bool active = !w.localFile.empty() && widen(w.localFile) == m_config.currentMediaPath;
+    if (!m_library.removeSaved(w)) {
+        notify("My Wallpapers", { { color::red, "Couldn't delete that file." } });
+        return;
+    }
+    if (active) {
+        m_engine.stop();
+        m_config.currentWallpaperId.clear();
+        m_config.currentMediaPath.clear();
+        m_config.save();
+    }
+    notify("My Wallpapers", { { color::yellow, std::string("Deleted \"").append(w.title).append("\".") } });
+}
+
+void App::wallpaperDetail(const Wallpaper& w) {
+    Wallpaper wr = w;
+    if (wr.url.empty() && !wr.sourceUrl.empty()) {
+        Frame f;
+        draw::banner(f);
+        draw::title(f, "Loading…");
+        f.raw(color::gray).raw("  Fetching ").raw(wr.title).raw("…").raw(color::reset).line();
+        m_term.present(f);
+        std::string err;
+        if (!m_library.resolve(wr, err)) {
+            notify("Library", { { color::red, "Couldn't open this wallpaper:" },
+                                { color::gray, std::string("  ").append(err) } });
+            return;
+        }
+    }
+
+    const bool cached = Library::isDownloaded(wr);
+
+    auto line = [](const std::string& label, const std::string& value) -> std::string {
+        if (value.empty()) return {};
+        std::string r;
+        r.reserve(4 + label.size() + 2 + value.size());
+        r.append("\r\n  ").append(label).append(": ").append(value);
+        return r;
+    };
+    std::string detail;
+    detail += line("Author", wr.author);
+    detail += line("Resolution", wr.resolution);
+    detail += line("Tags", joinTags(wr.tags));
+    if (wr.sizeMb > 0) detail += line("Size", std::to_string(wr.sizeMb).append(" MB"));
+    detail += line("Status", cached ? "✓ ready" : "not downloaded");
+
+    const bool canPreview = !wr.previewVideo.empty() || !wr.preview.empty();
+
+    std::string wt;
+    wt.reserve(14 + wr.title.size());
+    wt.append("Wallpaper · ").append(wr.title);
+    Menu actions(m_term, wt, detail);
+    std::vector<MenuItem> items = {
+        { cached ? "Apply (whole desktop)" : "Download & apply", "" },
+    };
+    if (canPreview) items.push_back({ "Preview", "open in browser/player" });
+    items.push_back({ "Assign to a monitor…", "" });
+    items.push_back({ "Export a copy…", "" });
+    const bool canOptimize = cached && needsOptimize(Library::localPath(wr));
+    if (canOptimize) items.push_back({ "Optimize for this PC…", "smaller file, less GPU" });
+    if (wr.isLocal) items.push_back({ "Delete", "" });
+    items.push_back({ "Back", "" });
+    actions.setItems(items);
+    actions.setFooter("↑/↓ move   ⏎ select   esc back");
+
+    const int previewIndex = canPreview ? 1 : -1;
+    const int assignIndex  = canPreview ? 2 : 1;
+    const int exportIndex  = canPreview ? 3 : 2;
+    const int optimizeIndex = canOptimize ? exportIndex + 1 : -1;
+    const int deleteIndex  = wr.isLocal ? (canOptimize ? optimizeIndex + 1 : exportIndex + 1) : -1;
+
+    int choice = actions.run();
+    if (choice == -1) return;
+    if (choice == 0)                  applyWallpaper(wr);
+    else if (choice == previewIndex)  previewWallpaper(wr);
+    else if (choice == assignIndex)   assignToMonitor(wr);
+    else if (choice == exportIndex)   exportWallpaper(wr);
+    else if (choice == optimizeIndex) optimizeWallpaper(wr);
+    else if (choice == deleteIndex)   deleteWallpaper(wr);
+}
+
+void App::previewWallpaper(const Wallpaper& w) {
+    int cols = 96, rows = 30;
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        cols = csbi.srWindow.Right - csbi.srWindow.Left + 1 - 4;
+        rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1 - 13;
+        if (cols < 24) cols = 24;
+        if (rows < 8)  rows = 8;
+    }
+
+    if (!w.previewVideo.empty()) {
+        Frame f;
+        draw::banner(f);
+        f.line("  Opening video in your browser/player...");
+        m_term.present(f);
+        ShellExecuteW(nullptr, L"open", widen(w.previewVideo).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        Sleep(1000);
+        return;
+    }
+
+    std::string img;
+    if (!w.preview.empty()) {
+        std::vector<unsigned char> raw;
+        std::string err;
+        if (http::getBytes(widen(w.preview), raw, err, L"", 1024 * 1024))
+            tui::renderImageFromMemory(raw, cols, rows, img);
+    }
+
+    Frame f;
+    draw::banner(f);
+    std::string pt;
+    pt.reserve(12 + w.title.size());
+    pt.append("Preview · ").append(w.title);
+    draw::title(f, pt);
+    if (!img.empty()) f.raw(img);
+    else f.raw(color::gray).raw("  (no in-console preview for this one)").raw(color::reset).line();
+    f.line();
+    draw::footer(f, "any key: back");
+    m_term.present(f);
+
+    m_term.readKey();
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
+bool App::prepareMedia(const Wallpaper& w, std::wstring& outPath) {
+    struct Ctx {
+        const Wallpaper* w;
+        int lastPct;
+        App* app;
+    };
+    Ctx ctx{ &w, -2, this };
+
+    auto progressFrame = [&](const std::string& statusLine) {
+        Frame f;
+        draw::banner(f);
+        std::string pt2;
+        pt2.reserve(14 + w.title.size());
+        pt2.append("Preparing · ").append(w.title);
+        draw::title(f, pt2);
+        f.line();
+        f.raw("  ").raw(statusLine).line();
+        m_term.present(f);
+    };
+
+    auto onProgress = +[](int pct, void* vctx) {
+        auto* c = (Ctx*)vctx;
+        if (pct == c->lastPct) return;
+        c->lastPct = pct;
+        auto pf = [&](const std::string& sl) {
+            Frame f;
+            draw::banner(f);
+            std::string pt2;
+            pt2.reserve(14 + c->w->title.size());
+            pt2.append("Preparing · ").append(c->w->title);
+            draw::title(f, pt2);
+            f.line();
+            f.raw("  ").raw(sl).line();
+            c->app->m_term.present(f);
+        };
+        if (pct < 0) {
+            pf(std::string(color::cyan).append("Downloading…").append(color::reset));
+        } else {
+            int filled = pct / 5;
+            std::string bar(filled, '#');
+            bar.append(20 - filled, '.');
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Downloading  [%s] %3d%%", bar.c_str(), pct);
+            pf(std::string(color::cyan).append(buf).append(color::reset));
+        }
+    };
+
+    if (!Library::isDownloaded(w))
+        progressFrame(std::string(color::gray).append("Starting…").append(color::reset));
+
+    std::string err;
+    if (!m_library.ensureDownloaded(w, onProgress, &ctx, outPath, err)) {
+        notify("Download failed", { { color::red, err } });
+        return false;
+    }
+    return true;
+}
+
+bool App::prepareEfficientMedia(const Wallpaper& w, std::wstring& outPath) {
+    if (!prepareMedia(w, outPath)) return false;
+    if (!needsOptimize(outPath)) return true;
+
+    std::wstring dest = outPath;
+    size_t dot = dest.find_last_of(L'.');
+    size_t slash = dest.find_last_of(L"\\/");
+    if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash))
+        dest.resize(dot);
+    dest += L".opt.mp4";
+
+    if (!fileExists(dest)) {
+        struct Ctx {
+            App* app;
+            int lastPct;
+            std::string title;
+        };
+        Ctx ctx{ this, -2, w.title };
+
+        auto onProgress = +[](int pct, void* vctx) {
+            auto* c = (Ctx*)vctx;
+            if (pct == c->lastPct) return;
+            c->lastPct = pct;
+            Frame f;
+            draw::banner(f);
+            std::string pt;
+            pt.reserve(14 + c->title.size());
+            pt.append("Preparing · ").append(c->title);
+            draw::title(f, pt);
+            f.line();
+            if (pct < 0) {
+                f.raw(color::cyan).raw("  Slimming down for this PC…").raw(color::reset).line();
+            } else {
+                int filled = pct / 5;
+                std::string bar(filled, '#');
+                bar.append(20 - filled, '.');
+                char buf[96];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, "  Slimming down  [%s] %3d%%", bar.c_str(), pct);
+                f.raw(color::cyan).raw(buf).raw(color::reset).line();
+            }
+            c->app->m_term.present(f);
+        };
+
+        OptimizeStats stats;
+        std::string oerr, note;
+        if (!optimizeVideo(outPath, dest, onProgress, &ctx, stats, oerr, note)) {
+            notify("Efficient playback", {
+                { color::yellow, std::string("Using original file: ").append(oerr) },
+            });
+            return true;
+        }
+    }
+    outPath = dest;
+    return true;
+}
+
+bool App::applyWallpaper(const Wallpaper& w) {
+    std::wstring path;
+    if (!prepareEfficientMedia(w, path)) return false;
+
+    m_config.mode = WallpaperMode::Span;
+    m_config.currentWallpaperId = w.id;
+    m_config.currentMediaPath   = path;
+    m_config.save();
+
+    std::string err;
+    if (!m_engine.restart(err)) {
+        notify("Could not start wallpaper", { { color::red, err } });
+        return false;
+    }
+
+    notify("Wallpaper applied", {
+        { color::green, std::string("✓ ").append(w.title).append(" is now live across your desktop.") },
+        { color::gray,  "It keeps running in the background (see the tray icon)." },
+        { color::gray,  autostart::isEnabled()
+                            ? "It will also resume automatically on Windows startup."
+                            : "Enable 'Auto start' in Settings to auto-resume." },
+    });
+    return true;
+}
+
+void App::assignToMonitor(const Wallpaper& w) {
+    std::vector<MonitorInfo> monitors = enumerateMonitors();
+    if (monitors.empty()) {
+        notify("Per-monitor", { { color::red, "No monitors detected." } });
+        return;
+    }
+
+    std::string menuTitle;
+    menuTitle.reserve(14 + w.title.size());
+    menuTitle.append("Assign \u201c").append(w.title).append("\u201d to\u2026");
+    Menu menu(m_term, menuTitle, "Pick a monitor");
+    std::vector<MenuItem> items;
+    for (const MonitorInfo& m : monitors) {
+        char dims[48];
+        _snprintf_s(dims, sizeof(dims), _TRUNCATE, "%dx%d", m.width, m.height);
+        std::string label;
+        label.reserve(16);
+        label.append("Monitor ").append(std::to_string(m.index));
+        if (m.primary) label.append(" (primary)");
+        std::string hint = std::string(dims);
+        auto it = m_config.monitorAssignments.find(m.device);
+        if (it != m_config.monitorAssignments.end()) hint += "  · assigned";
+        items.push_back({ label, hint });
+    }
+    items.push_back({ "Cancel", "" });
+    menu.setItems(items);
+    menu.setFooter("↑/↓ move   ⏎ assign   esc cancel");
+
+    int choice = menu.run();
+    if (choice < 0 || choice >= (int)monitors.size()) return;
+
+    std::wstring path;
+    if (!prepareEfficientMedia(w, path)) return;
+
+    m_config.monitorAssignments[monitors[choice].device] = path;
+    m_config.mode = WallpaperMode::PerMonitor;
+    m_config.save();
+
+    std::string err;
+    if (!m_engine.restart(err)) {
+        notify("Per-monitor", { { color::red, err } });
+        return;
+    }
+    notify("Per-monitor", {
+        { color::green, std::string("✓ ").append(w.title).append(" assigned to Monitor ")
+                            .append(std::to_string(monitors[choice].index)).append(".") },
+        { color::gray,  "Switched to per-monitor mode." },
+    });
+}
+
+void App::exportWallpaper(const Wallpaper& w) {
+    std::wstring dest = dialogs::saveVideoFile(std::wstring(widen(w.id)).append(L".mp4"));
+    if (dest.empty()) return;
+
+    Frame f;
+    draw::banner(f);
+    std::string et;
+    et.reserve(14 + w.title.size());
+    et.append("Exporting · ").append(w.title);
+    draw::title(f, et);
+    f.line();
+    f.raw(color::cyan).raw("  Exporting (downloading first if needed)…").raw(color::reset).line();
+    m_term.present(f);
+
+    std::string err;
+    if (m_library.exportMedia(w, dest, err))
+        notify("Export", { { color::green, "✓ Saved to:" }, { color::gray, narrow(dest) } });
+    else
+        notify("Export failed", { { color::red, err } });
+}
+
+void App::optimizeWallpaper(const Wallpaper& w) {
+    std::wstring src;
+    if (!prepareMedia(w, src)) return;
+
+    std::wstring dest = src;
+    size_t dot = dest.find_last_of(L'.');
+    size_t slash = dest.find_last_of(L"\\/");
+    if (dot != std::wstring::npos && (slash == std::wstring::npos || dot > slash))
+        dest.resize(dot);
+    dest += L".opt.mp4";
+
+    struct Ctx {
+        App* app;
+        int lastPct;
+        std::string title;
+    };
+    Ctx ctx{ this, -2, w.title };
+
+    auto onProgress = +[](int pct, void* vctx) {
+        auto* c = (Ctx*)vctx;
+        if (pct == c->lastPct) return;
+        c->lastPct = pct;
+        Frame f;
+        draw::banner(f);
+        std::string ot;
+        ot.reserve(14 + c->title.size());
+        ot.append("Optimizing · ").append(c->title);
+        draw::title(f, ot);
+        f.line();
+        if (pct < 0) {
+            f.raw(color::cyan).raw("  Working…").raw(color::reset).line();
+        } else {
+            int filled = pct / 5;
+            std::string bar(filled, '#');
+            bar.append(20 - filled, '.');
+            char buf[96];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, "  Shrinking for this PC  [%s] %3d%%", bar.c_str(), pct);
+            f.raw(color::cyan).raw(buf).raw(color::reset).line();
+        }
+        c->app->m_term.present(f);
+    };
+
+    {
+        Frame f;
+        draw::banner(f);
+        std::string ot;
+        ot.reserve(14 + w.title.size());
+        ot.append("Optimizing · ").append(w.title);
+        draw::title(f, ot);
+        f.line();
+        f.raw(color::cyan).raw("  Starting…").raw(color::reset).line();
+        m_term.present(f);
+    }
+
+    OptimizeStats stats;
+    std::string oerr, note;
+    if (!optimizeVideo(src, dest, onProgress, &ctx, stats, oerr, note)) {
+        notify("Optimize failed", { { color::red, oerr } });
+        return;
+    }
+
+    char sum[128];
+    _snprintf_s(sum, sizeof(sum), _TRUNCATE, "%dx%d → %dx%d, %.1f MB",
+                stats.inW, stats.inH, stats.outW, stats.outH,
+                stats.outBytes / 1048576.0);
+    pointConfigAtMedia(src, dest);
+    m_config = Config::load();
+    std::string rerr;
+    if (m_engine.isRunning()) m_engine.restart(rerr);
+    std::vector<std::pair<const char*, std::string>> lines = {
+        { color::green, std::string("✓ Now playing the lighter copy.") },
+        { color::gray, sum },
+    };
+    if (!note.empty()) lines.push_back({ color::yellow, note });
+    notify("Optimize", lines);
+}
+
+void App::importWallpaper() {
+    std::wstring src = dialogs::openVideoFile();
+    if (src.empty()) return;
+
+    Frame f;
+    draw::banner(f);
+    draw::title(f, "Import");
+    f.raw(color::cyan).raw("  Importing video…").raw(color::reset).line();
+    m_term.present(f);
+
+    std::string id, err;
+    if (!m_library.importFile(src, id, err)) {
+        notify("Import failed", { { color::red, err } });
+        return;
+    }
+
+    const Wallpaper* added = nullptr;
+    for (const Wallpaper* w : m_library.items())
+        if (w->id == id) { added = w; break; }
+    if (!added) {
+        notify("Import", { { color::green, "✓ Added to your library." } });
+        return;
+    }
+
+    Menu menu(m_term, "Imported ✓", added->title);
+    menu.setItems({
+        { "Apply now (whole desktop)", "" },
+        { "Assign to a monitor…", "" },
+        { "Just add to library", "" },
+    });
+    Wallpaper copy = *added;
+    switch (menu.run()) {
+        case 0: applyWallpaper(copy);   break;
+        case 1: assignToMonitor(copy);  break;
+        default: break;
+    }
+}
+
+void App::perMonitorSetup() {
+    while (true) {
+        std::vector<MonitorInfo> monitors = enumerateMonitors();
+
+        Menu menu(m_term, "Per-monitor setup",
+                  m_config.mode == WallpaperMode::PerMonitor
+                      ? "Mode: per-monitor (active)"
+                      : "Mode: span - assign a screen below to switch");
+
+        std::vector<MenuItem> items;
+        for (const MonitorInfo& m : monitors) {
+            std::string label;
+            label.reserve(16);
+            label.append("Monitor ").append(std::to_string(m.index));
+            if (m.primary) label.append(" (primary)");
+            auto it = m_config.monitorAssignments.find(m.device);
+            std::string hint;
+            if (it != m_config.monitorAssignments.end()) {
+                std::wstring p = it->second;
+                size_t s = p.find_last_of(L"\\/");
+                hint = narrow(s == std::wstring::npos ? p : p.substr(s + 1));
+            } else {
+                hint = "- not set -";
+            }
+            items.push_back({ label, hint });
+        }
+        items.push_back({ "Switch to single (span) wallpaper", "" });
+        items.push_back({ "Back", "" });
+        menu.setItems(items);
+        menu.setFooter("↑/↓ move   ⏎ select   esc back");
+
+        int choice = menu.run();
+        const int spanIndex = (int)monitors.size();
+        const int backIndex = spanIndex + 1;
+
+        if (choice == -1 || choice == backIndex) return;
+
+        if (choice == spanIndex) {
+            m_config.mode = WallpaperMode::Span;
+            m_config.save();
+            std::string err;
+            if (m_engine.isRunning()) m_engine.restart(err);
+            notify("Per-monitor setup", { { color::yellow, "Switched to single-wallpaper (span) mode." } });
+            continue;
+        }
+
+        std::string pickPrompt;
+        pickPrompt.reserve(36);
+        pickPrompt.append("Choose a wallpaper for Monitor ").append(std::to_string(monitors[choice].index));
+        int wi = pickWallpaper(pickPrompt, "It will be downloaded if needed");
+        if (wi < 0 || wi >= (int)m_library.items().size()) continue;
+
+        Wallpaper w = *m_library.items()[wi];
+        std::wstring path;
+        if (!prepareEfficientMedia(w, path)) continue;
+
+        m_config.monitorAssignments[monitors[choice].device] = path;
+        m_config.mode = WallpaperMode::PerMonitor;
+        m_config.save();
+        std::string err;
+        m_engine.restart(err);
+        notify("Per-monitor setup",
+               { { color::green, std::string("✓ ").append(w.title).append(" set on Monitor ")
+                                     .append(std::to_string(monitors[choice].index)).append(".") } });
+    }
+}
+
+void App::activeWallpaper() {
+    while (true) {
+        const bool running = m_engine.isRunning();
+        const bool haveLast = !m_config.currentMediaPath.empty() ||
+                              !m_config.monitorAssignments.empty();
+
+        std::string subtitle;
+        if (running) {
+            if (m_config.mode == WallpaperMode::PerMonitor) {
+                subtitle = "Running: per-monitor wallpapers";
+            } else {
+                subtitle = "Running: ";
+                subtitle += m_config.currentWallpaperId.empty() ? "custom" : m_config.currentWallpaperId;
+            }
+        } else {
+            subtitle = "No wallpaper is running.";
+        }
+
+        Menu menu(m_term, "Engine Status & Active Wallpaper", subtitle);
+        menu.setItems({
+            { "Stop Engine (Hide Wallpaper)",   "", running },
+            { running ? "Restart Engine" : "Start Engine (Resume last wallpaper)", "", haveLast },
+            { "Default Audio", m_config.muteByDefault ? "muted" : "on" },
+            { "Back", "" },
+        });
+        menu.setFooter("↑/↓ move   ⏎ select   esc back");
+
+        std::string err;
+        switch (menu.run()) {
+            case 0:
+                m_engine.stop();
+                notify("Active Wallpaper", { { color::yellow, "Wallpaper stopped." } });
+                break;
+            case 1:
+                if (haveLast && m_engine.restart(err))
+                    notify("Active Wallpaper",
+                           { { color::green, running ? "Wallpaper restarted." : "Wallpaper resumed." } });
+                else if (haveLast)
+                    notify("Active Wallpaper", { { color::red, err } });
+                break;
+            case 2:
+                m_config.muteByDefault = !m_config.muteByDefault;
+                m_config.save();
+                if (m_engine.isRunning()) m_engine.restart(err);
+                break;
+            case 3: case -1:
+                return;
+            default:
+                break;
+        }
+    }
+}
+
+void App::settings() {
+    while (true) {
+        const bool autoOn = autostart::isEnabled();
+
+        Menu menu(m_term, "Settings", "");
+        menu.setItems({
+            { "Performance",          "smoothness & battery" },
+            { "Wallpapers per load",   std::to_string(m_config.libraryCount) },
+            { "Check for updates now", "" },
+            { "Auto update",          m_config.checkForUpdatesOnLaunch ? "on" : "off" },
+            { "Connect Pexels",       m_config.pexelsApiKey.empty() ? "not set" : "connected" },
+            { "Auto start",           autoOn ? "enabled" : "disabled" },
+            { "Default mute",         m_config.muteByDefault ? "on" : "off" },
+            { "Debug log",            "view & open folder" },
+            { "Help & about",         "" },
+            { "Back", "" },
+        });
+        menu.setFooter("↑/↓ move   ⏎ edit   esc back");
+
+        switch (menu.run()) {
+            case 0:
+                performanceSettings();
+                break;
+            case 1: {
+                int c = m_config.libraryCount;
+                m_config.libraryCount = c < 24 ? 24 : c < 48 ? 48 : 12;
+                m_config.save();
+                m_catalogLoaded = false;
+                break;
+            }
+            case 2:
+                showUpdateDialog(true);
+                break;
+            case 3:
+                m_config.checkForUpdatesOnLaunch = !m_config.checkForUpdatesOnLaunch;
+                m_config.save();
+                break;
+            case 4:
+                connectPexels();
+                break;
+            case 5: {
+                bool ok = autoOn ? autostart::disable() : autostart::enable();
+                if (!ok)
+                    notify("Settings", { { color::red, "Could not update the auto start setting." } });
+                break;
+            }
+            case 6: {
+                m_config.muteByDefault = !m_config.muteByDefault;
+                m_config.save();
+                std::string err;
+                if (m_engine.isRunning()) m_engine.restart(err);
+                break;
+            }
+            case 7: {
+                ShellExecuteW(nullptr, L"open", Config::logsDir().c_str(), nullptr, nullptr, SW_SHOW);
+                notify("Debug Log", {
+                    { color::green, "Opened log folder in File Explorer." },
+                    { color::gray, "Send 'debug.log' to the developer for support:" },
+                    { color::cyan, narrow(Config::logPath()) },
+                    { color::gray, narrow(Config::appDataLogPath()) }
+                });
+                break;
+            }
+            case 8:
+                help();
+                break;
+            case 9: case -1:
+                return;
+            default:
+                break;
+        }
+    }
+}
+
+void App::connectPexels() {
+    Frame f;
+    draw::banner(f);
+    draw::title(f, "Connect Pexels");
+    f.line("  Pexels gives you a huge, searchable library of free videos.");
+    f.raw("  ").raw(color::gray).raw("Get a free key at pexels.com/api (takes a minute).").raw(color::reset).line();
+    f.raw("  ").raw(color::gray).raw("Paste it below, or leave blank to disconnect.").raw(color::reset).line();
+    f.line();
+    f.raw("  ");
+    m_term.present(f);
+
+    std::string key = m_term.readLineAt(14, 3, narrow(m_config.pexelsApiKey));
+    m_config.pexelsApiKey = widen(key);
+    m_config.save();
+    m_catalogLoaded = false;
+    m_pexelsQuery.clear();
+    notify("Pexels", { { key.empty() ? color::yellow : color::green,
+                         key.empty() ? "Disconnected from Pexels."
+                                     : "✓ Pexels key saved." } });
+}
+
+void App::performanceSettings() {
+    while (true) {
+        auto qName = [&] {
+            switch (m_config.quality) {
+                case Quality::High:   return "High (up to 4K)";
+                case Quality::Medium: return "Medium (1080p)";
+                case Quality::Low:    return "Low (720p)";
+                default:              return "Auto (match screen)";
+            }
+        };
+
+        auto pauseModeName = [&] {
+            if (m_config.pauseUnlessDesktop) return "When any app focused";
+            if (m_config.pauseOnFullscreen && m_config.pauseWhenMaximized) return "Maximized + Fullscreen";
+            if (m_config.pauseOnFullscreen) return "Fullscreen only";
+            return "Never (always play)";
+        };
+
+        char hw[96];
+        _snprintf_s(hw, sizeof(hw), _TRUNCATE, "This PC: %s · %d cores · %d GB · %d MB VRAM",
+                    tierName(m_hw), m_hw.cores, m_hw.ramGB, m_hw.vramMB);
+
+        char speed[16];
+        _snprintf_s(speed, sizeof(speed), _TRUNCATE, "%.2gx", m_config.playbackSpeed);
+
+        char timeout[32];
+        if (m_config.occlusionTimeoutSec <= 0)
+            _snprintf_s(timeout, sizeof(timeout), _TRUNCATE, "auto (8s)");
+        else
+            _snprintf_s(timeout, sizeof(timeout), _TRUNCATE, "%d sec", m_config.occlusionTimeoutSec);
+
+        Menu menu(m_term, "Performance", hw);
+        menu.setItems({
+            { "Detect my PC (auto-tune)", "" },
+            { "Auto-pause mode",         pauseModeName() },
+            { "Quality",                 qName() },
+            { "Target FPS",              m_config.targetFps == 60 ? "60 FPS" : "30 FPS" },
+            { "Pause when fullscreen",   m_config.pauseOnFullscreen ? "on" : "off" },
+            { "Pause when maximized",    m_config.pauseWhenMaximized ? "on" : "off" },
+            { "Pause when app focused",  m_config.pauseUnlessDesktop ? "on" : "off" },
+            { "Pause on battery",        m_config.pauseOnBattery ? "on" : "off" },
+            { "Low-end mode",            m_config.lowEndMode ? "on" : "off" },
+            { "Playback speed",          speed },
+            { "Deep sleep after",        timeout },
+            { "Back", "" },
+        });
+        menu.setFooter("↑/↓ move   ⏎ toggle   esc back");
+
+        std::string err;
+        auto restartIfLive = [&] { if (m_engine.isRunning()) m_engine.restart(err); };
+
+        switch (menu.run()) {
+            case 0:
+                autoTune(true);
+                break;
+            case 1: {
+                if (m_config.pauseUnlessDesktop) {
+                    m_config.pauseOnFullscreen = false;
+                    m_config.pauseWhenMaximized = false;
+                    m_config.pauseUnlessDesktop = false;
+                } else if (m_config.pauseOnFullscreen && m_config.pauseWhenMaximized) {
+                    m_config.pauseOnFullscreen = true;
+                    m_config.pauseWhenMaximized = false;
+                    m_config.pauseUnlessDesktop = false;
+                } else if (m_config.pauseOnFullscreen) {
+                    m_config.pauseOnFullscreen = true;
+                    m_config.pauseWhenMaximized = true;
+                    m_config.pauseUnlessDesktop = true;
+                } else {
+                    m_config.pauseOnFullscreen = true;
+                    m_config.pauseWhenMaximized = true;
+                    m_config.pauseUnlessDesktop = false;
+                }
+                m_config.save(); restartIfLive();
+                break;
+            }
+            case 2:
+                m_config.quality = (Quality)(((int)m_config.quality + 1) % 4);
+                m_config.save();
+                m_catalogLoaded = false;
+                break;
+            case 3:
+                m_config.targetFps = (m_config.targetFps == 60) ? 30 : 60;
+                m_config.save(); restartIfLive();
+                break;
+            case 4:
+                m_config.pauseOnFullscreen = !m_config.pauseOnFullscreen;
+                m_config.save(); restartIfLive();
+                break;
+            case 5:
+                m_config.pauseWhenMaximized = !m_config.pauseWhenMaximized;
+                m_config.save(); restartIfLive();
+                break;
+            case 6:
+                m_config.pauseUnlessDesktop = !m_config.pauseUnlessDesktop;
+                m_config.save(); restartIfLive();
+                break;
+            case 7:
+                m_config.pauseOnBattery = !m_config.pauseOnBattery;
+                m_config.save(); restartIfLive();
+                break;
+            case 8:
+                m_config.lowEndMode = !m_config.lowEndMode;
+                m_config.save(); m_catalogLoaded = false; restartIfLive();
+                break;
+            case 9: {
+                static const double steps[] = { 0.5, 0.75, 1.0, 1.25, 1.5, 2.0 };
+                int idx = 2;
+                for (int i = 0; i < 6; ++i) if (steps[i] == m_config.playbackSpeed) idx = i;
+                m_config.playbackSpeed = steps[(idx + 1) % 6];
+                m_config.save(); restartIfLive();
+                break;
+            }
+            case 10: {
+                static const int steps[] = { 0, 10, 30, 60, 120, 300 };
+                int idx = 0;
+                for (int i = 0; i < 6; ++i) if (steps[i] == m_config.occlusionTimeoutSec) idx = i;
+                m_config.occlusionTimeoutSec = steps[(idx + 1) % 6];
+                m_config.save(); restartIfLive();
+                break;
+            }
+            case 11: case -1:
+                return;
+            default:
+                break;
+        }
+    }
+}
+
+}
